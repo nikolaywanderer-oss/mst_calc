@@ -36,7 +36,7 @@ TEXTS = {
         "welcome": (
             "🚗 **Добро пожаловать в MySwissTransfer!**\n\n"
             "Вы можете отправить заказ в произвольной форме, например:\n"
-            "💬 *«Цюрих аэропорт — Цюрих 29.12.26 13:10 для 2 человек»*\n\n"
+            "💬 *«Zurich Airport — Grindelwald 29.12.26 13:10 для 2 человек»*\n\n"
             "Или нажмите /start для пошагового заполнения."
         ),
         "ask_from": "📍 Введите адрес отправления (Точка А):",
@@ -68,7 +68,7 @@ TEXTS = {
             "👥 Пассажиров: {passengers}\n"
             "👤 Клиент: @{username}"
         ),
-        "error_geocode": "❌ Адрес не найден. Введите более точный адрес:",
+        "error_geocode": "❌ Адрес не найден. Введите более точный адрес (желательно на английском/немецком):",
         "error_route": "❌ Не удалось рассчитать маршрут. Проверьте адреса и попробуйте снова.",
         "cancel": "Расчёт отменён. Напишите /start чтобы начать заново.",
     },
@@ -171,7 +171,9 @@ def calc_price(car_type: str, length: float) -> float:
 
 def geocode(address: str):
     url = "https://geocode.search.hereapi.com/v1/geocode"
-    params = {"q": address, "apiKey": HERE_API_KEY, "limit": 1}
+    # Добавляем Switzerland для точности поиска, если в адресе нет страны
+    q = address if "switzerland" in address.lower() or "schweiz" in address.lower() else f"{address}, Switzerland"
+    params = {"q": q, "apiKey": HERE_API_KEY, "limit": 1}
     try:
         resp = requests.get(url, params=params, timeout=10)
         resp.raise_for_status()
@@ -208,7 +210,7 @@ def get_distance(origin, destination):
 
 
 def parse_order_with_ai(text: str) -> dict:
-    """Парсит свободный текст через OpenRouter LLM."""
+    """Парсит свободный текст через OpenRouter LLM с принудительной нормализацией для HERE API."""
     if not OPENROUTER_API_KEY:
         return {"is_order": False}
     
@@ -216,10 +218,12 @@ def parse_order_with_ai(text: str) -> dict:
     Проанализируй текст и определи, является ли он запросом на расчет трансфера или заказа автомобиля.
     Верни ТОЛЬКО валидный JSON без markdown-разметки (без ```json ... ```) со следующими полями:
     - "is_order": true, если клиент указал откуда и куда ехать, иначе false
-    - "from": точка отправления (строка или null)
-    - "to": точка назначения (строка или null)
+    - "from": точка отправления на АНГЛИЙСКОМ или НЕМЕЦКОМ языке, оптимизированная для HERE API (например, "Zurich Airport", "Basel", "Zurich"). Если это аэропорт, пиши "Zurich Airport" или "EuroAirport".
+    - "to": точка назначения на АНГЛИЙСКОМ или НЕМЕЦКОМ языке (например, "Grindelwald", "Zurich", "Lauterbrunnen", "Lucerne").
     - "datetime": дата и время поездки если указаны (строка или null)
     - "passengers": количество пассажиров числом (если указано, иначе null)
+
+    Важно: Все русские географические названия обязательно переводи на английский/немецкий язык (например, "Цюрих аэропорт" -> "Zurich Airport", "Гринденвальд" -> "Grindelwald"), чтобы геокодер Швейцарии их правильно понял.
 
     Текст клиента: "{text}"
     """
@@ -266,11 +270,9 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lang = context.user_data.get("lang", "ru")
     t = TEXTS[lang]
 
-    # Пытаемся распознать заказ через ИИ
     parsed = parse_order_with_ai(text)
 
     if parsed.get("is_order") and parsed.get("from") and parsed.get("to"):
-        # Если ИИ успешно распознал маршрут
         context.user_data["from"] = parsed["from"]
         context.user_data["to"] = parsed["to"]
         if parsed.get("datetime"):
@@ -317,7 +319,6 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return CHOOSE_CAR
 
     else:
-        # Если текст не похож на заказ — выводим приветствие и инструкцию
         context.user_data["lang"] = lang
         await update.message.reply_text(
             TEXTS[lang]["welcome"],
@@ -330,7 +331,6 @@ async def get_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
     text = update.message.text
     
-    # Проверяем, не отправил ли пользователь сразу готовый запрос
     parsed = parse_order_with_ai(text)
     if parsed.get("is_order") and parsed.get("from") and parsed.get("to"):
         return await handle_free_text(update, context)
@@ -395,7 +395,6 @@ async def choose_car(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["price"] = calc_price(car_id, context.user_data["distance"])
     await query.edit_message_reply_markup(None)
     
-    # Если дата/время уже были переданы через ИИ, пропускаем вопрос о дате
     if context.user_data.get("datetime"):
         await query.message.reply_text(TEXTS[lang]["ask_phone"])
         return GET_PHONE
