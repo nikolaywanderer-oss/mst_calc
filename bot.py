@@ -528,7 +528,7 @@ def main():
             GET_PHONE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
+        # allow_reentry убран, чтобы текущий диалог (включая ввод телефона) не прерывался
     )
 
     application.add_handler(conv)
