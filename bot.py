@@ -2,6 +2,7 @@ import os
 import asyncio
 import threading
 import logging
+import json
 import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,13 +26,19 @@ BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID_RAW = os.environ.get("ADMIN_TELEGRAM_ID", "0")
 ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
 HERE_API_KEY = os.environ.get("HERE_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # Conversation states
 CHOOSE_LANG, GET_FROM, GET_TO, CHOOSE_CAR, GET_DATETIME, GET_PHONE = range(6)
 
 TEXTS = {
     "ru": {
-        "welcome": "🚗 Добро пожаловать!\n\nЯ помогу рассчитать стоимость трансфера.\n\nВыберите язык:",
+        "welcome": (
+            "🚗 **Добро пожаловать в MySwissTransfer!**\n\n"
+            "Вы можете отправить заказ в произвольной форме, например:\n"
+            "💬 *«Цюрих аэропорт — Цюрих 29.12.26 13:10 для 2 человек»*\n\n"
+            "Или нажмите /start для пошагового заполнения."
+        ),
         "ask_from": "📍 Введите адрес отправления (Точка А):",
         "ask_to": "📍 Введите адрес прибытия (Точка Б):",
         "calculating": "⏳ Рассчитываю маршрут...",
@@ -46,7 +53,8 @@ TEXTS = {
             "🚗 Автомобиль: {car}\n"
             "💶 Стоимость: €{price:.0f}\n"
             "📅 Дата/время: {dt}\n"
-            "📞 Телефон: {phone}\n\n"
+            "📞 Телефон: {phone}\n"
+            "👥 Пассажиров: {passengers}\n\n"
             "Спасибо! Мы свяжемся с вами для подтверждения."
         ),
         "admin_order": (
@@ -57,6 +65,7 @@ TEXTS = {
             "💶 Стоимость: €{price:.0f}\n"
             "📅 Дата/время: {dt}\n"
             "📞 Телефон: {phone}\n"
+            "👥 Пассажиров: {passengers}\n"
             "👤 Клиент: @{username}"
         ),
         "error_geocode": "❌ Адрес не найден. Введите более точный адрес:",
@@ -64,7 +73,12 @@ TEXTS = {
         "cancel": "Расчёт отменён. Напишите /start чтобы начать заново.",
     },
     "en": {
-        "welcome": "🚗 Welcome!\n\nI will help you calculate the transfer price.\n\nChoose language:",
+        "welcome": (
+            "🚗 **Welcome to MySwissTransfer!**\n\n"
+            "You can send your transfer request in free form, for example:\n"
+            "💬 *«Zurich Airport — Zurich 29.12.26 13:10 for 2 people»*\n\n"
+            "Or type /start for step-by-step entry."
+        ),
         "ask_from": "📍 Enter pickup address (Point A):",
         "ask_to": "📍 Enter destination address (Point B):",
         "calculating": "⏳ Calculating route...",
@@ -79,7 +93,8 @@ TEXTS = {
             "🚗 Car: {car}\n"
             "💶 Price: €{price:.0f}\n"
             "📅 Date/time: {dt}\n"
-            "📞 Phone: {phone}\n\n"
+            "📞 Phone: {phone}\n"
+            "👥 Passengers: {passengers}\n\n"
             "Thank you! We will contact you to confirm."
         ),
         "admin_order": (
@@ -90,6 +105,7 @@ TEXTS = {
             "💶 Price: €{price:.0f}\n"
             "📅 Date/time: {dt}\n"
             "📞 Phone: {phone}\n"
+            "👥 Passengers: {passengers}\n"
             "👤 Client: @{username}"
         ),
         "error_geocode": "❌ Address not found. Please enter a more precise address:",
@@ -117,7 +133,6 @@ CAR_NAMES = {
 
 
 def calc_price(car_type: str, length: float) -> float:
-    """Calculate transfer price in EUR based on car type and distance in km."""
     rates = {
         "bk": [
             (15, 82), (35, 3.55), (50, 3.37), (70, 3.22), (105, 3.12),
@@ -149,7 +164,7 @@ def calc_price(car_type: str, length: float) -> float:
     for i, (limit, rate) in enumerate(tiers):
         if length <= limit:
             if i == 0:
-                return rate  # flat rate for short trips (≤15 km)
+                return rate
             return length * rate
     return length * tiers[-1][1]
 
@@ -186,41 +201,141 @@ def get_distance(origin, destination):
         if not routes:
             return None
         length = routes[0]["sections"][0]["summary"]["length"]
-        return length / 1000  # metres → km
+        return length / 1000
     except Exception as e:
         logger.error(f"Route error: {e}")
         return None
+
+
+def parse_order_with_ai(text: str) -> dict:
+    """Парсит свободный текст через OpenRouter LLM."""
+    if not OPENROUTER_API_KEY:
+        return {"is_order": False}
+    
+    prompt = f"""
+    Проанализируй текст и определи, является ли он запросом на расчет трансфера или заказа автомобиля.
+    Верни ТОЛЬКО валидный JSON без markdown-разметки (без ```json ... ```) со следующими полями:
+    - "is_order": true, если клиент указал откуда и куда ехать, иначе false
+    - "from": точка отправления (строка или null)
+    - "to": точка назначения (строка или null)
+    - "datetime": дата и время поездки если указаны (строка или null)
+    - "passengers": количество пассажиров числом (если указано, иначе null)
+
+    Текст клиента: "{text}"
+    """
+    
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
+    
+    try:
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=10)
+        res_json = response.json()
+        content = res_json["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.startswith("json"):
+                content = content[4:].strip()
+        return json.loads(content)
+    except Exception as e:
+        logger.error(f"AI parse error: {e}")
+        return {"is_order": False}
 
 
 # ─── Handlers ────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
-    keyboard = [
-        [
-            InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
-            InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
-        ]
-    ]
-    await update.message.reply_text(
-        "🚗 Добро пожаловать! / Welcome!\n\nВыберите язык / Choose language:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CHOOSE_LANG
-
-
-async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    lang = "ru" if query.data == "lang_ru" else "en"
+    lang = "ru"
     context.user_data["lang"] = lang
-    await query.edit_message_text(TEXTS[lang]["ask_from"])
+    await update.message.reply_text(
+        TEXTS[lang]["welcome"],
+        parse_mode="Markdown"
+    )
     return GET_FROM
+
+
+async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    lang = context.user_data.get("lang", "ru")
+    t = TEXTS[lang]
+
+    # Пытаемся распознать заказ через ИИ
+    parsed = parse_order_with_ai(text)
+
+    if parsed.get("is_order") and parsed.get("from") and parsed.get("to"):
+        # Если ИИ успешно распознал маршрут
+        context.user_data["from"] = parsed["from"]
+        context.user_data["to"] = parsed["to"]
+        if parsed.get("datetime"):
+            context.user_data["datetime"] = parsed["datetime"]
+        if parsed.get("passengers"):
+            context.user_data["passengers"] = parsed["passengers"]
+        else:
+            context.user_data["passengers"] = "Не указано"
+
+        calc_msg = await update.message.reply_text(t["calculating"])
+
+        from_coords = geocode(context.user_data["from"])
+        if not from_coords:
+            await calc_msg.delete()
+            await update.message.reply_text(t["error_geocode"])
+            return GET_FROM
+
+        to_coords = geocode(context.user_data["to"])
+        if not to_coords:
+            await calc_msg.delete()
+            await update.message.reply_text(t["error_geocode"])
+            return GET_TO
+
+        distance = get_distance(from_coords, to_coords)
+        await calc_msg.delete()
+        if distance is None:
+            await update.message.reply_text(t["error_route"])
+            return GET_TO
+
+        context.user_data["distance"] = distance
+        car_names = CAR_NAMES[lang]
+
+        keyboard = []
+        for car_id, car_name in car_names.items():
+            price = calc_price(car_id, distance)
+            keyboard.append(
+                [InlineKeyboardButton(f"{car_name} — €{price:.0f}", callback_data=f"car_{car_id}")]
+            )
+
+        await update.message.reply_text(
+            t["distance"].format(distance),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return CHOOSE_CAR
+
+    else:
+        # Если текст не похож на заказ — выводим приветствие и инструкцию
+        context.user_data["lang"] = lang
+        await update.message.reply_text(
+            TEXTS[lang]["welcome"],
+            parse_mode="Markdown"
+        )
+        return GET_FROM
 
 
 async def get_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
-    context.user_data["from"] = update.message.text
+    text = update.message.text
+    
+    # Проверяем, не отправил ли пользователь сразу готовый запрос
+    parsed = parse_order_with_ai(text)
+    if parsed.get("is_order") and parsed.get("from") and parsed.get("to"):
+        return await handle_free_text(update, context)
+
+    context.user_data["from"] = text
     await update.message.reply_text(TEXTS[lang]["ask_to"])
     return GET_TO
 
@@ -279,8 +394,14 @@ async def choose_car(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["car_name"] = CAR_NAMES[lang][car_id]
     context.user_data["price"] = calc_price(car_id, context.user_data["distance"])
     await query.edit_message_reply_markup(None)
-    await query.message.reply_text(TEXTS[lang]["ask_datetime"])
-    return GET_DATETIME
+    
+    # Если дата/время уже были переданы через ИИ, пропускаем вопрос о дате
+    if context.user_data.get("datetime"):
+        await query.message.reply_text(TEXTS[lang]["ask_phone"])
+        return GET_PHONE
+    else:
+        await query.message.reply_text(TEXTS[lang]["ask_datetime"])
+        return GET_DATETIME
 
 
 async def get_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -296,14 +417,18 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["phone"] = update.message.text
     d = context.user_data
 
+    passengers = d.get("passengers", "Не указано")
+    dt = d.get("datetime", "Не указано")
+
     summary = t["order_summary"].format(
         from_=d["from"],
         to=d["to"],
         dist=d["distance"],
         car=d["car_name"],
         price=d["price"],
-        dt=d["datetime"],
+        dt=dt,
         phone=d["phone"],
+        passengers=passengers,
     )
     await update.message.reply_text(summary)
 
@@ -319,8 +444,9 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             dist=d["distance"],
             car=d["car_name"],
             price=d["price"],
-            dt=d["datetime"],
+            dt=dt,
             phone=d["phone"],
+            passengers=passengers,
             username=username,
         )
         try:
@@ -347,7 +473,7 @@ class AliveHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"I am alive")
 
     def log_message(self, format, *args):
-        pass  # suppress noisy access logs
+        pass
 
 
 def run_web_server():
@@ -360,18 +486,20 @@ def run_web_server():
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Please add it as a secret.")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
     if not HERE_API_KEY:
-        raise RuntimeError("HERE_API_KEY is not set. Please add it as a secret.")
+        raise RuntimeError("HERE_API_KEY is not set.")
 
     threading.Thread(target=run_web_server, daemon=True).start()
 
     application = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text)
+        ],
         states={
-            CHOOSE_LANG: [CallbackQueryHandler(choose_lang, pattern="^lang_")],
             GET_FROM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_from)],
             GET_TO:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_to)],
             CHOOSE_CAR:  [CallbackQueryHandler(choose_car, pattern="^car_")],
