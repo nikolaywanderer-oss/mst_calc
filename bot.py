@@ -131,7 +131,6 @@ CAR_NAMES = {
     },
 }
 
-
 def calc_price(car_type: str, length: float) -> float:
     rates = {
         "bk": [
@@ -168,10 +167,8 @@ def calc_price(car_type: str, length: float) -> float:
             return length * rate
     return length * tiers[-1][1]
 
-
 def geocode(address: str):
     url = "https://geocode.search.hereapi.com/v1/geocode"
-    
     clean_addr = address.strip()
     if "zurich airport" in clean_addr.lower() or "цюрих аэропорт" in clean_addr.lower():
         q = "Zurich Airport, Kloten, Switzerland"
@@ -195,7 +192,6 @@ def geocode(address: str):
         logger.error(f"Geocode error for '{q}': {e}")
         return None
 
-
 def get_distance(origin, destination):
     url = "https://router.hereapi.com/v8/routes"
     params = {
@@ -216,7 +212,6 @@ def get_distance(origin, destination):
     except Exception as e:
         logger.error(f"Route error: {e}")
         return None
-
 
 def parse_order_with_ai(text: str) -> dict:
     if not OPENROUTER_API_KEY:
@@ -259,7 +254,6 @@ def parse_order_with_ai(text: str) -> dict:
         logger.error(f"AI parse error: {e}")
         return {"is_order": False}
 
-
 # ─── Handlers ────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -272,10 +266,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return GET_FROM
 
-
 async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = update.message.text
-    lang = context.user_data.get("lang", "ru")
+    lang = "en" if not any(c in "абвгдежзийклмнопрстуфхцчшщъыьэюя" for c in text.lower()) else "ru"
+    context.user_data["lang"] = lang
     t = TEXTS[lang]
 
     parsed = parse_order_with_ai(text)
@@ -288,7 +282,7 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if parsed.get("passengers"):
             context.user_data["passengers"] = parsed["passengers"]
         else:
-            context.user_data["passengers"] = "Не указано"
+            context.user_data["passengers"] = "Не указано" if lang == "ru" else "Not specified"
 
         calc_msg = await update.message.reply_text(t["calculating"])
 
@@ -327,13 +321,11 @@ async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return CHOOSE_CAR
 
     else:
-        context.user_data["lang"] = lang
         await update.message.reply_text(
             TEXTS[lang]["welcome"],
             parse_mode="Markdown"
         )
         return GET_FROM
-
 
 async def get_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
@@ -346,7 +338,6 @@ async def get_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["from"] = text
     await update.message.reply_text(TEXTS[lang]["ask_to"])
     return GET_TO
-
 
 async def get_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
@@ -392,7 +383,6 @@ async def get_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return CHOOSE_CAR
 
-
 async def choose_car(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -410,20 +400,17 @@ async def choose_car(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await query.message.reply_text(TEXTS[lang]["ask_datetime"])
         return GET_DATETIME
 
-
 async def choose_car_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "⚠️ Пожалуйста, выберите класс автомобиля, нажав на одну из кнопок выше 👆"
-    )
+    lang = context.user_data.get("lang", "ru")
+    msg = "⚠️ Please choose a car class by clicking one of the buttons above 👆" if lang == "en" else "⚠️ Пожалуйста, выберите класс автомобиля, нажав на одну из кнопок выше 👆"
+    await update.message.reply_text(msg)
     return CHOOSE_CAR
-
 
 async def get_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
     context.user_data["datetime"] = update.message.text
     await update.message.reply_text(TEXTS[lang]["ask_phone"])
     return GET_PHONE
-
 
 async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
@@ -474,12 +461,10 @@ async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
-
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     lang = context.user_data.get("lang", "ru")
     await update.message.reply_text(TEXTS[lang]["cancel"])
     return ConversationHandler.END
-
 
 # ─── Keep-alive web server ────────────────────────────────────────────────────
 
@@ -493,12 +478,10 @@ class AliveHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-
 def run_web_server():
     server = HTTPServer(("0.0.0.0", 3000), AliveHandler)
     logger.info("Keep-alive server running on port 3000")
     server.serve_forever()
-
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
@@ -528,13 +511,11 @@ def main():
             GET_PHONE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        # allow_reentry убран, чтобы текущий диалог (включая ввод телефона) не прерывался
     )
 
     application.add_handler(conv)
     logger.info("Transfer bot started. Polling for updates...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
