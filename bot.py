@@ -170,4 +170,371 @@ def calc_price(car_type: str, length: float) -> float:
 
 
 def geocode(address: str):
-    url = "
+    url = "https://geocode.search.hereapi.com/v1/geocode"
+    
+    clean_addr = address.strip()
+    if "zurich airport" in clean_addr.lower() or "цюрих аэропорт" in clean_addr.lower():
+        q = "Zurich Airport, Kloten, Switzerland"
+    elif "basel airport" in clean_addr.lower() or "базель аэропорт" in clean_addr.lower():
+        q = "EuroAirport Basel-Mulhouse-Freiburg, France"
+    elif "switzerland" in clean_addr.lower() or "schweiz" in clean_addr.lower():
+        q = clean_addr
+    else:
+        q = f"{clean_addr}, Switzerland"
+
+    params = {"q": q, "apiKey": HERE_API_KEY, "limit": 1}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        if not items:
+            return None
+        pos = items[0]["position"]
+        return pos["lat"], pos["lng"]
+    except Exception as e:
+        logger.error(f"Geocode error for '{q}': {e}")
+        return None
+
+
+def get_distance(origin, destination):
+    url = "https://router.hereapi.com/v8/routes"
+    params = {
+        "transportMode": "car",
+        "origin": f"{origin[0]},{origin[1]}",
+        "destination": f"{destination[0]},{destination[1]}",
+        "return": "summary",
+        "apiKey": HERE_API_KEY,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        routes = resp.json().get("routes", [])
+        if not routes:
+            return None
+        length = routes[0]["sections"][0]["summary"]["length"]
+        return length / 1000
+    except Exception as e:
+        logger.error(f"Route error: {e}")
+        return None
+
+
+def parse_order_with_ai(text: str) -> dict:
+    if not OPENROUTER_API_KEY:
+        return {"is_order": False}
+    
+    prompt = f"""
+    Проанализируй текст и определи, является ли он запросом на расчет трансфера или заказа автомобиля.
+    Верни ТОЛЬКО валидный JSON без markdown-разметки со следующими полями:
+    - "is_order": true, если клиент указал откуда и куда ехать, иначе false
+    - "from": точка отправления на АНГЛИЙСКОМ языке (например, "Zurich Airport", "Zurich", "Basel").
+    - "to": точка назначения на АНГЛИЙСКОМ языке (например, "Grindelwald", "Zurich Main Station", "Lauterbrunnen"). Если цель - город Цюрих, пиши "Zurich City Center".
+    - "datetime": дата и время поездки если указаны (строка или null)
+    - "passengers": количество пассажиров числом (если указано, иначе null)
+
+    Все русские топонимы обязательно переводи на английский язык.
+
+    Текст клиента: "{text}"
+    """
+    
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
+    
+    try:
+        response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=10)
+        res_json = response.json()
+        content = res_json["choices"][0]["message"]["content"].strip()
+        if content.startswith("```"):
+            content = content.strip("`")
+            if content.startswith("json"):
+                content = content[4:].strip()
+        return json.loads(content)
+    except Exception as e:
+        logger.error(f"AI parse error: {e}")
+        return {"is_order": False}
+
+
+# ─── Handlers ────────────────────────────────────────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    lang = "ru"
+    context.user_data["lang"] = lang
+    await update.message.reply_text(
+        TEXTS[lang]["welcome"],
+        parse_mode="Markdown"
+    )
+    return GET_FROM
+
+
+async def handle_free_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    lang = context.user_data.get("lang", "ru")
+    t = TEXTS[lang]
+
+    parsed = parse_order_with_ai(text)
+
+    if parsed.get("is_order") and parsed.get("from") and parsed.get("to"):
+        context.user_data["from"] = parsed["from"]
+        context.user_data["to"] = parsed["to"]
+        if parsed.get("datetime"):
+            context.user_data["datetime"] = parsed["datetime"]
+        if parsed.get("passengers"):
+            context.user_data["passengers"] = parsed["passengers"]
+        else:
+            context.user_data["passengers"] = "Не указано"
+
+        calc_msg = await update.message.reply_text(t["calculating"])
+
+        from_coords = geocode(context.user_data["from"])
+        if not from_coords:
+            await calc_msg.delete()
+            await update.message.reply_text(t["error_geocode"])
+            return GET_FROM
+
+        to_coords = geocode(context.user_data["to"])
+        if not to_coords:
+            await calc_msg.delete()
+            await update.message.reply_text(t["error_geocode"])
+            return GET_TO
+
+        distance = get_distance(from_coords, to_coords)
+        await calc_msg.delete()
+        if distance is None:
+            await update.message.reply_text(t["error_route"])
+            return GET_TO
+
+        context.user_data["distance"] = distance
+        car_names = CAR_NAMES[lang]
+
+        keyboard = []
+        for car_id, car_name in car_names.items():
+            price = calc_price(car_id, distance)
+            keyboard.append(
+                [InlineKeyboardButton(f"{car_name} — €{price:.0f}", callback_data=f"car_{car_id}")]
+            )
+
+        await update.message.reply_text(
+            t["distance"].format(distance),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return CHOOSE_CAR
+
+    else:
+        context.user_data["lang"] = lang
+        await update.message.reply_text(
+            TEXTS[lang]["welcome"],
+            parse_mode="Markdown"
+        )
+        return GET_FROM
+
+
+async def get_from(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ru")
+    text = update.message.text
+    
+    parsed = parse_order_with_ai(text)
+    if parsed.get("is_order") and parsed.get("from") and parsed.get("to"):
+        return await handle_free_text(update, context)
+
+    context.user_data["from"] = text
+    await update.message.reply_text(TEXTS[lang]["ask_to"])
+    return GET_TO
+
+
+async def get_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ru")
+    t = TEXTS[lang]
+    context.user_data["to"] = update.message.text
+    calc_msg = await update.message.reply_text(t["calculating"])
+
+    from_coords = geocode(context.user_data["from"])
+    if not from_coords:
+        await calc_msg.delete()
+        context.user_data.pop("from", None)
+        await update.message.reply_text(t["error_geocode"])
+        await update.message.reply_text(t["ask_from"])
+        return GET_FROM
+
+    to_coords = geocode(context.user_data["to"])
+    if not to_coords:
+        await calc_msg.delete()
+        context.user_data.pop("to", None)
+        await update.message.reply_text(t["error_geocode"])
+        await update.message.reply_text(t["ask_to"])
+        return GET_TO
+
+    distance = get_distance(from_coords, to_coords)
+    await calc_msg.delete()
+    if distance is None:
+        await update.message.reply_text(t["error_route"])
+        return GET_TO
+
+    context.user_data["distance"] = distance
+    car_names = CAR_NAMES[lang]
+
+    keyboard = []
+    for car_id, car_name in car_names.items():
+        price = calc_price(car_id, distance)
+        keyboard.append(
+            [InlineKeyboardButton(f"{car_name} — €{price:.0f}", callback_data=f"car_{car_id}")]
+        )
+
+    await update.message.reply_text(
+        t["distance"].format(distance),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return CHOOSE_CAR
+
+
+async def choose_car(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    lang = context.user_data.get("lang", "ru")
+    car_id = query.data.replace("car_", "")
+    context.user_data["car_id"] = car_id
+    context.user_data["car_name"] = CAR_NAMES[lang][car_id]
+    context.user_data["price"] = calc_price(car_id, context.user_data["distance"])
+    await query.edit_message_reply_markup(None)
+    
+    if context.user_data.get("datetime"):
+        await query.message.reply_text(TEXTS[lang]["ask_phone"])
+        return GET_PHONE
+    else:
+        await query.message.reply_text(TEXTS[lang]["ask_datetime"])
+        return GET_DATETIME
+
+
+async def choose_car_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "⚠️ Пожалуйста, выберите класс автомобиля, нажав на одну из кнопок выше 👆"
+    )
+    return CHOOSE_CAR
+
+
+async def get_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ru")
+    context.user_data["datetime"] = update.message.text
+    await update.message.reply_text(TEXTS[lang]["ask_phone"])
+    return GET_PHONE
+
+
+async def get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ru")
+    t = TEXTS[lang]
+    context.user_data["phone"] = update.message.text
+    d = context.user_data
+
+    passengers = d.get("passengers", "Не указано")
+    dt = d.get("datetime", "Не указано")
+
+    summary = t["order_summary"].format(
+        from_=d["from"],
+        to=d["to"],
+        dist=d["distance"],
+        car=d["car_name"],
+        price=d["price"],
+        dt=dt,
+        phone=d["phone"],
+        passengers=passengers,
+    )
+    await update.message.reply_text(summary, parse_mode="Markdown")
+
+    if ADMIN_ID:
+        username = (
+            f"@{update.effective_user.username}"
+            if update.effective_user.username
+            else update.effective_user.first_name or "Без юзернейма"
+        )
+        admin_text = TEXTS["ru"]["admin_order"].format(
+            from_=d["from"],
+            to=d["to"],
+            dist=d["distance"],
+            car=d["car_name"],
+            price=d["price"],
+            dt=dt,
+            phone=d["phone"],
+            passengers=passengers,
+            username=username,
+        )
+        try:
+            await context.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode="Markdown")
+            logger.info(f"Notification sent successfully to ADMIN_ID: {ADMIN_ID}")
+        except Exception as e:
+            logger.error(f"Failed to notify admin ({ADMIN_ID}): {e}")
+    else:
+        logger.warning("ADMIN_TELEGRAM_ID is not set or invalid!")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang = context.user_data.get("lang", "ru")
+    await update.message.reply_text(TEXTS[lang]["cancel"])
+    return ConversationHandler.END
+
+
+# ─── Keep-alive web server ────────────────────────────────────────────────────
+
+class AliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"I am alive")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_web_server():
+    server = HTTPServer(("0.0.0.0", 3000), AliveHandler)
+    logger.info("Keep-alive server running on port 3000")
+    server.serve_forever()
+
+
+# ─── Entry point ─────────────────────────────────────────────────────────────
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
+    if not HERE_API_KEY:
+        raise RuntimeError("HERE_API_KEY is not set.")
+
+    threading.Thread(target=run_web_server, daemon=True).start()
+
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_free_text)
+        ],
+        states={
+            GET_FROM:    [MessageHandler(filters.TEXT & ~filters.COMMAND, get_from)],
+            GET_TO:      [MessageHandler(filters.TEXT & ~filters.COMMAND, get_to)],
+            CHOOSE_CAR:  [
+                CallbackQueryHandler(choose_car, pattern="^car_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, choose_car_fallback)
+            ],
+            GET_DATETIME:[MessageHandler(filters.TEXT & ~filters.COMMAND, get_datetime)],
+            GET_PHONE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    application.add_handler(conv)
+    logger.info("Transfer bot started. Polling for updates...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
